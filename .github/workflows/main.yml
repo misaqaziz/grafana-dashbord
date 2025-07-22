@@ -1,0 +1,108 @@
+name: EC2 Deploy & Grafana Dashboard
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-east-1
+  INSTANCE_TYPE: t2.micro
+  AMI_ID: ami-0cbbe2c6a1bb2ad63  # Amazon Linux 2 (us-east-1)
+
+jobs:
+  create-ec2:
+    name: 🚀 Create EC2 Instance
+    runs-on: ubuntu-latest
+    outputs:
+      public_ip: ${{ steps.get_ip.outputs.ip }}
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Launch EC2 with user-data script
+        run: |
+          cat <<EOF > user-data.sh
+          #!/bin/bash
+          yum update -y
+          yum install -y httpd
+          systemctl start httpd
+          systemctl enable httpd
+          echo "<h1>EC2 Launched</h1>" > /var/www/html/index.html
+          EOF
+
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id $AMI_ID \
+            --instance-type $INSTANCE_TYPE \
+            --key-name my-key \
+            --user-data file://user-data.sh \
+            --security-groups my-sg \
+            --query 'Instances[0].InstanceId' \
+            --output text)
+
+          echo "Waiting for EC2 to be in running state..."
+          aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+
+          IP=$(aws ec2 describe-instances \
+            --instance-ids $INSTANCE_ID \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)
+
+          echo "ip=$IP" >> "$GITHUB_OUTPUT"
+
+  upload-app:
+    name: 📤 Push Files to EC2 & Restart HTTPD
+    needs: create-ec2
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Upload index.html to EC2
+        run: |
+          echo "${{ secrets.EC2_KEY }}" > key.pem
+          chmod 400 key.pem
+
+          scp -o StrictHostKeyChecking=no -i key.pem app/index.html ec2-user@${{ needs.create-ec2.outputs.public_ip }}:/tmp/index.html
+
+          ssh -o StrictHostKeyChecking=no -i key.pem ec2-user@${{ needs.create-ec2.outputs.public_ip }} <<EOF
+            sudo mv /tmp/index.html /var/www/html/index.html
+            sudo systemctl restart httpd
+          EOF
+
+  grafana:
+    name: 📊 Create Grafana Dashboard
+    needs: upload-app
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Create Dashboard via Grafana API
+        run: |
+          curl -X POST ${{ secrets.GRAFANA_URL }}/api/dashboards/db \
+          -H "Authorization: Bearer ${{ secrets.GRAFANA_API_KEY }}" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "dashboard": {
+              "id": null,
+              "uid": null,
+              "title": "Auto Dashboard",
+              "tags": ["auto"],
+              "timezone": "browser",
+              "panels": [{
+                "type": "text",
+                "title": "Welcome Panel",
+                "gridPos": { "x": 0, "y": 0, "w": 12, "h": 6 },
+                "options": {
+                  "content": "Welcome to the Auto-Deployed Dashboard!",
+                  "mode": "markdown"
+                }
+              }]
+            },
+            "overwrite": true
+          }'
